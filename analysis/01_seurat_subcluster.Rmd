@@ -1,0 +1,92 @@
+---
+title: "01 · Seurat (HVG) subclustering — `r params$cellset`"
+output:
+  html_document:
+    toc: true
+    code_folding: hide
+params:
+  cellset: "ob334"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 9, fig.height = 5)
+source(file.path(rprojroot::find_root("CLAUDE.md"), "R/utils.R"))
+library(clustree)
+out_dir <- cellset_dir(params$cellset)
+set.seed(SEED)
+```
+
+## Data
+```{r load}
+obj <- load_cellset(params$cellset)
+obj
+table(obj$cellset_label, obj$timepoint)
+stopifnot(ncol(obj) == c(ob334 = 334, obfin = 6083)[[params$cellset]])
+```
+
+## HVG selection and PCA
+```{r hvg-pca}
+obj <- FindVariableFeatures(obj, selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+obj <- embed_features(obj)
+dims <- 1:choose_dims(obj)
+ElbowPlot(obj, ndims = N_PCS) + geom_vline(xintercept = max(dims), linetype = 2) +
+  ggtitle(sprintf("Using %d PCs", max(dims)))
+```
+
+## Resolution sweep
+```{r sweep, fig.height=8}
+obj <- cluster_sweep(obj, dims, prefix = "hvg")
+summ <- sweep_summary(obj, "hvg")
+knitr::kable(summ)
+clustree(obj, prefix = "hvg_")
+res <- pick_resolution(summ)
+obj$hvg_cluster <- obj[[paste0("hvg_", res)]][, 1]
+Idents(obj) <- "hvg_cluster"
+cat("Chosen resolution:", res, "-> K =", nlevels(obj$hvg_cluster), "\n")
+table(obj$hvg_cluster)
+```
+
+## UMAP
+```{r umap, fig.width=12}
+obj <- RunUMAP(obj, dims = dims, seed.use = SEED, verbose = FALSE)
+DimPlot(obj, label = TRUE) + DimPlot(obj, group.by = "timepoint") +
+  DimPlot(obj, group.by = "cellset_label") + plot_layout(ncol = 3) & theme(legend.text = element_text(size = 7))
+FeaturePlot(obj, intersect(OB_MARKERS, rownames(obj)), ncol = 5) & NoAxes()
+```
+
+## Markers
+```{r markers}
+markers <- FindAllMarkers(obj, only.pos = TRUE, logfc.threshold = 0.25, min.pct = 0.1, verbose = FALSE)
+markers$specificity <- markers$pct.1 - markers$pct.2
+top <- markers %>% filter(p_val_adj < 0.05) %>% group_by(cluster) %>% slice_max(avg_log2FC, n = 8)
+knitr::kable(top[, c("cluster", "gene", "avg_log2FC", "pct.1", "pct.2", "p_val_adj")], digits = 3)
+```
+
+## Sensitivity to the number of HVGs
+```{r sensitivity}
+sens <- sapply(c(1000, 3000), function(n) {
+  o <- FindVariableFeatures(obj, nfeatures = n, verbose = FALSE)
+  o <- embed_features(o)
+  o <- FindNeighbors(o, dims = dims, k.param = k_for(ncol(o)), verbose = FALSE)
+  o <- FindClusters(o, resolution = res, random.seed = SEED, verbose = FALSE)
+  c(K = nlevels(Idents(o)), ARI_vs_2000 = safe_ari(Idents(o), obj$hvg_cluster))
+})
+colnames(sens) <- c("1000 HVGs", "3000 HVGs")
+knitr::kable(t(sens), digits = 3)
+```
+
+## Reproducibility check
+```{r repro}
+o <- FindClusters(obj, resolution = res, random.seed = SEED, verbose = FALSE)
+stopifnot(safe_ari(Idents(o), obj$hvg_cluster) == 1)
+cat("Same-seed rerun ARI = 1\n")
+```
+
+```{r save}
+obj@misc$hvg_dims <- dims
+obj@misc$hvg_res  <- res
+obj@misc$hvg_features <- VariableFeatures(obj)
+obj[["pca_hvg"]] <- obj[["pca"]]; obj[["umap_hvg"]] <- obj[["umap"]]
+saveRDS(obj, file.path(out_dir, "ob_seurat.rds"))
+write.csv(markers, file.path(out_dir, "markers_seurat.csv"), row.names = FALSE)
+```

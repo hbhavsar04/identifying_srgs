@@ -1,0 +1,112 @@
+---
+title: "02 · Festem subclustering — `r params$cellset`"
+output:
+  html_document:
+    toc: true
+    code_folding: hide
+params:
+  cellset: "ob334"
+  threads: 8
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 9, fig.height = 5)
+source(file.path(rprojroot::find_root("CLAUDE.md"), "R/utils.R"))
+library(clustree)
+out_dir <- cellset_dir(params$cellset)
+set.seed(SEED)
+```
+
+Festem needs a preliminary clustering (the "prior") to define its EM-test mixture. By default it
+builds this from HVGs. Here we pass the Seurat-arm clusters from `01` explicitly, so both arms share
+the same starting point. Festem then **chooses its own genes**, and we recluster on those genes alone.
+
+## Load the Seurat arm
+```{r load}
+obj <- readRDS(file.path(out_dir, "ob_seurat.rds"))
+dims <- obj@misc$hvg_dims
+table(obj$hvg_cluster)
+```
+
+## Festem: main prior (chosen HVG clusters)
+```{r festem-main}
+small <- names(which(table(obj$hvg_cluster) <= 10))
+if (length(small)) cat("Prior clusters with <=10 cells (dropped by Festem):", small, "\n")
+t0 <- Sys.time()
+fe <- run_festem(obj, "hvg_cluster", threads = params$threads)
+cat("Festem runtime:", format(Sys.time() - t0), "\n")
+sel <- select_festem_genes(fe)
+cat("Selection rule:", sel$rule, "\n")
+cat("Genes selected:", length(sel$genes), "\n")
+festem_tab <- fe[["RNA"]][[]][, c("Festem_p_adj", "Festem_EM", "Festem_rank")]
+festem_tab$gene <- rownames(festem_tab)
+festem_tab$selected <- festem_tab$gene %in% sel$genes
+festem_tab <- festem_tab[order(festem_tab$Festem_rank), ]
+knitr::kable(head(festem_tab, 25), digits = 4, row.names = FALSE)
+```
+
+## Festem: sensitivity to the prior
+We rerun Festem with a coarser prior: the lowest sweep resolution with a different K.
+```{r festem-alt}
+summ_h <- sweep_summary(obj, "hvg")
+alt_res <- summ_h$resolution[summ_h$n_clusters >= 2 & summ_h$n_clusters != nlevels(obj$hvg_cluster)][1]
+obj$hvg_alt <- obj[[paste0("hvg_", alt_res)]][, 1]
+fe_alt <- run_festem(obj, "hvg_alt", threads = params$threads)
+sel_alt <- select_festem_genes(fe_alt)
+jac <- length(intersect(sel$genes, sel_alt$genes)) / length(union(sel$genes, sel_alt$genes))
+knitr::kable(data.frame(
+  prior = c(sprintf("hvg res %s (K=%d)", obj@misc$hvg_res, nlevels(obj$hvg_cluster)),
+            sprintf("hvg res %s (K=%d)", alt_res, nlevels(droplevels(obj$hvg_alt)))),
+  rule = c(sel$rule, sel_alt$rule),
+  n_genes = c(length(sel$genes), length(sel_alt$genes))))
+cat(sprintf("Jaccard overlap of selected genes across priors: %.2f\n", jac))
+```
+
+## Recluster on Festem genes
+```{r embed, fig.height=8}
+VariableFeatures(obj) <- sel$genes
+obj <- embed_features(obj, features = sel$genes, npcs = min(N_PCS, length(sel$genes) - 1))
+ElbowPlot(obj, ndims = min(N_PCS, length(sel$genes) - 1)) + geom_vline(xintercept = max(dims), linetype = 2)
+obj <- cluster_sweep(obj, dims, prefix = "festem")
+summ <- sweep_summary(obj, "festem")
+knitr::kable(summ)
+clustree(obj, prefix = "festem_")
+res <- pick_resolution(summ)
+obj$festem_cluster <- obj[[paste0("festem_", res)]][, 1]
+Idents(obj) <- "festem_cluster"
+cat("Chosen resolution:", res, "-> K =", nlevels(obj$festem_cluster), "\n")
+```
+
+## UMAP
+```{r umap, fig.width=12}
+obj <- RunUMAP(obj, dims = dims, seed.use = SEED, verbose = FALSE)
+DimPlot(obj, label = TRUE) + DimPlot(obj, group.by = "timepoint") +
+  DimPlot(obj, group.by = "cellset_label") + plot_layout(ncol = 3) & theme(legend.text = element_text(size = 7))
+```
+
+## Markers
+```{r markers}
+markers <- FindAllMarkers(obj, only.pos = TRUE, logfc.threshold = 0.25, min.pct = 0.1, verbose = FALSE)
+markers$specificity <- markers$pct.1 - markers$pct.2
+markers$festem_selected <- markers$gene %in% sel$genes
+top <- markers %>% filter(p_val_adj < 0.05) %>% group_by(cluster) %>% slice_max(avg_log2FC, n = 8)
+knitr::kable(top[, c("cluster", "gene", "avg_log2FC", "pct.1", "pct.2", "p_val_adj", "festem_selected")], digits = 3)
+```
+
+## Reproducibility check
+```{r repro}
+o <- FindClusters(obj, resolution = res, random.seed = SEED, verbose = FALSE)
+stopifnot(safe_ari(Idents(o), obj$festem_cluster) == 1)
+cat("Same-seed rerun ARI = 1\n")
+```
+
+```{r save}
+obj@misc$festem_res   <- res
+obj@misc$festem_rule  <- sel$rule
+obj@misc$festem_genes <- sel$genes
+obj@misc$festem_genes_alt <- sel_alt$genes
+obj[["pca_festem"]] <- obj[["pca"]]; obj[["umap_festem"]] <- obj[["umap"]]
+saveRDS(obj, file.path(out_dir, "ob_festem.rds"))
+write.csv(festem_tab, file.path(out_dir, "festem_genes.csv"), row.names = FALSE)
+write.csv(markers, file.path(out_dir, "markers_festem.csv"), row.names = FALSE)
+```

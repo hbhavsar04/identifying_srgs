@@ -1,0 +1,209 @@
+---
+title: "03 · Seurat (HVG) vs Festem — `r params$cellset`"
+output:
+  html_document:
+    toc: true
+    code_folding: hide
+params:
+  cellset: "ob334"
+  n_stability: 50
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 9, fig.height = 5)
+source(file.path(rprojroot::find_root("CLAUDE.md"), "R/utils.R"))
+out_dir <- cellset_dir(params$cellset)
+set.seed(SEED)
+```
+
+```{r load}
+obj <- readRDS(file.path(out_dir, "ob_festem.rds"))   # contains both arms
+dims <- obj@misc$hvg_dims
+hvg <- obj@misc$hvg_features
+fg  <- obj@misc$festem_genes
+mk_h <- read.csv(file.path(out_dir, "markers_seurat.csv"), colClasses = c(cluster = "character"))
+mk_f <- read.csv(file.path(out_dir, "markers_festem.csv"), colClasses = c(cluster = "character"))
+cat("Festem selection rule:", obj@misc$festem_rule, "\n")
+```
+
+## 1 · Feature sets
+```{r features}
+sets <- list(HVG = hvg, Festem = fg, Festem_altPrior = obj@misc$festem_genes_alt)
+knitr::kable(data.frame(
+  set = names(sets), n = lengths(sets),
+  overlap_with_HVG = sapply(sets, function(s) length(intersect(s, hvg))),
+  jaccard_with_HVG = sapply(sets, function(s) length(intersect(s, hvg)) / length(union(s, hvg)))),
+  digits = 3, row.names = FALSE)
+UpSetR::upset(UpSetR::fromList(sets), order.by = "freq")
+pos <- positional_genes(obj)
+cat("Positional-panel genes in HVG:", paste(intersect(pos, hvg), collapse = ", "), "\n\n")
+cat("Positional-panel genes in Festem:", paste(intersect(pos, fg), collapse = ", "), "\n\n")
+cat("Festem-only genes (top 40 by rank):",
+    paste(head(setdiff(fg, hvg), 40), collapse = ", "), "\n")
+```
+
+### What do the top PCs capture?
+Spearman correlation of each arm's top PCs with depth and cell-cycle scores. If a PC tracks
+depth or cycle, it reflects technical or proliferative signal rather than spatial identity.
+```{r pc-confound, fig.height=4}
+cc <- lapply(cc.genes.updated.2019, function(g) intersect(tolower(g), rownames(obj)))
+obj <- tryCatch(CellCycleScoring(obj, s.features = cc$s.genes, g2m.features = cc$g2m.genes),
+                error = function(e) { obj$S.Score <- NA; obj$G2M.Score <- NA; obj })
+covs <- data.frame(log_nCount = log10(obj$nCount_RNA), S = obj$S.Score, G2M = obj$G2M.Score)
+pc_cor <- do.call(rbind, lapply(c(HVG = "pca_hvg", Festem = "pca_festem"), function(r) {
+  e <- Embeddings(obj, r)[, 1:min(5, max(dims))]
+  m <- abs(cor(e, covs, method = "spearman", use = "pairwise"))
+  data.frame(arm = sub("pca_", "", r), PC = rownames(m), m, row.names = NULL)
+}))
+pc_cor$arm <- ifelse(pc_cor$arm == "hvg", "HVG", "Festem")
+tidyr::pivot_longer(pc_cor, -c(arm, PC)) %>%
+  ggplot(aes(PC, name, fill = value)) + geom_tile() + facet_wrap(~arm) +
+  geom_text(aes(label = round(value, 2)), size = 3) +
+  scale_fill_gradient(low = "white", high = "firebrick", limits = c(0, 1)) +
+  labs(fill = "|rho|", y = NULL)
+```
+
+## 2 · Partition agreement at matched K
+```{r matched-k}
+summ_h <- sweep_summary(obj, "hvg"); summ_f <- sweep_summary(obj, "festem")
+Ks <- sort(unique(c(nlevels(obj$hvg_cluster), nlevels(obj$festem_cluster),
+                    intersect(summ_h$n_clusters, summ_f$n_clusters))))
+Ks <- Ks[Ks >= 2][1:min(4, sum(Ks >= 2))]
+ref <- list(atlas_cluster = obj$atlas_cluster, cellset_label = obj$cellset_label,
+            timepoint = obj$timepoint)
+agree <- do.call(rbind, lapply(Ks, function(K) {
+  h <- obj[[paste0("hvg_", resolution_for_k(summ_h, K))]][, 1]
+  f <- obj[[paste0("festem_", resolution_for_k(summ_f, K))]][, 1]
+  data.frame(K = K, K_hvg = nlevels(droplevels(h)), K_festem = nlevels(droplevels(f)),
+             ARI_hvg_vs_festem = safe_ari(h, f), NMI_hvg_vs_festem = safe_nmi(h, f),
+             ARI_hvg_vs_timepoint = safe_ari(h, ref$timepoint),
+             ARI_festem_vs_timepoint = safe_ari(f, ref$timepoint),
+             ARI_hvg_vs_label = safe_ari(h, ref$cellset_label),
+             ARI_festem_vs_label = safe_ari(f, ref$cellset_label))
+}))
+knitr::kable(agree, digits = 3)
+```
+
+```{r contingency, fig.width=10, fig.height=4}
+ct <- table(HVG = obj$hvg_cluster, Festem = obj$festem_cluster)
+pheatmap::pheatmap(prop.table(ct, 1), display_numbers = ct, cluster_rows = FALSE, cluster_cols = FALSE,
+                   main = "Chosen partitions: row-normalised overlap (numbers = cells)")
+```
+
+## 3 · Cluster quality
+Silhouette widths are computed in each arm's own PCA and in one **shared** PCA (built on the union of
+both gene sets). The shared space keeps either arm from being favoured by its own embedding.
+```{r silhouette}
+shared <- union(hvg, fg)
+tmp <- ScaleData(obj, features = shared, verbose = FALSE)
+tmp <- RunPCA(tmp, features = shared, npcs = max(dims), seed.use = SEED, verbose = FALSE)
+emb_shared <- Embeddings(tmp, "pca")[, dims]
+sil <- data.frame(
+  arm = c("HVG", "Festem"),
+  K = c(nlevels(obj$hvg_cluster), nlevels(obj$festem_cluster)),
+  sil_own_space = c(mean_silhouette(obj$hvg_cluster, Embeddings(obj, "pca_hvg")[, dims]),
+                    mean_silhouette(obj$festem_cluster, Embeddings(obj, "pca_festem")[, dims])),
+  sil_shared_space = c(mean_silhouette(obj$hvg_cluster, emb_shared),
+                       mean_silhouette(obj$festem_cluster, emb_shared)),
+  n_sig_markers = c(sum(mk_h$p_val_adj < 0.05), sum(mk_f$p_val_adj < 0.05)),
+  median_specificity_top10 = c(
+    median((mk_h %>% filter(p_val_adj < 0.05) %>% group_by(cluster) %>% slice_max(specificity, n = 10))$specificity),
+    median((mk_f %>% filter(p_val_adj < 0.05) %>% group_by(cluster) %>% slice_max(specificity, n = 10))$specificity)))
+knitr::kable(sil, digits = 3)
+```
+
+## 4 · Stability (subsampling `r params$n_stability` × 80%)
+```{r stability, fig.height=4}
+stab <- rbind(
+  data.frame(arm = "HVG", ARI = stability_ari(obj, hvg, dims, obj@misc$hvg_res,
+                                              setNames(as.character(obj$hvg_cluster), colnames(obj)),
+                                              n_iter = params$n_stability)),
+  data.frame(arm = "Festem", ARI = stability_ari(obj, fg, dims, obj@misc$festem_res,
+                                                 setNames(as.character(obj$festem_cluster), colnames(obj)),
+                                                 n_iter = params$n_stability)))
+ggplot(stab, aes(arm, ARI)) + geom_boxplot(outlier.shape = NA) + geom_jitter(width = 0.15, alpha = 0.5) +
+  ylim(0, 1) + labs(title = "ARI of subsample reclustering vs full partition")
+knitr::kable(stab %>% group_by(arm) %>% summarise(median = median(ARI), IQR = IQR(ARI)), digits = 3)
+```
+
+## 5 · Confounding
+```{r confounding, fig.width=11, fig.height=4}
+covars <- c("timepoint", "gene_target", "embryo", "cellset_label", "orig.ident")
+cv <- sapply(c(HVG = "hvg_cluster", Festem = "festem_cluster"), function(cl)
+  sapply(covars, function(v) cramers_v(obj[[cl]][, 1], obj[[v]][, 1])))
+knitr::kable(cv, digits = 3, caption = "Cramér's V: cluster vs covariate")
+
+# Per-cluster flags used for candidate filtering.
+cluster_flags <- function(cl) {
+  md <- obj@meta.data; overall_tp <- prop.table(table(md$timepoint))
+  do.call(rbind, lapply(levels(md[[cl]]), function(k) {
+    x <- md[md[[cl]] == k, ]
+    tp <- prop.table(table(x$timepoint)); top_tp <- names(which.max(tp))
+    emb <- max(prop.table(table(x$embryo)))
+    data.frame(cluster = k, n = nrow(x), top_timepoint = top_tp,
+               tp_purity = max(tp), tp_enrichment = max(tp) / overall_tp[[top_tp]],
+               max_embryo_frac = emb, median_nCount = median(x$nCount_RNA),
+               frac_fin_bud = mean(x$cellset_label != "osteoblast"),
+               timepoint_driven = max(tp) > 0.8 & max(tp) / overall_tp[[top_tp]] > 1.5,
+               embryo_driven = emb > 0.5)
+  }))
+}
+flags <- list(HVG = cluster_flags("hvg_cluster"), Festem = cluster_flags("festem_cluster"))
+knitr::kable(flags$HVG, digits = 2, caption = "HVG clusters")
+knitr::kable(flags$Festem, digits = 2, caption = "Festem clusters")
+VlnPlot(obj, "nCount_RNA", group.by = "hvg_cluster", pt.size = 0) + ggtitle("HVG: nCount") +
+  VlnPlot(obj, "nCount_RNA", group.by = "festem_cluster", pt.size = 0) + ggtitle("Festem: nCount")
+```
+
+## 6 · Biology check
+General osteoblast markers should be broadly expressed across subclusters. Positional genes are
+where a spatial signal would show up.
+```{r biology, fig.width=14, fig.height=6}
+ob_g <- intersect(OB_MARKERS, rownames(obj))
+pos_expr <- pos[Matrix::rowSums(LayerData(obj, layer = "counts")[pos, , drop = FALSE] > 0) >= 0.05 * ncol(obj)]
+for (cl in c("hvg_cluster", "festem_cluster")) {
+  print(DotPlot(obj, features = list(osteoblast = ob_g, positional = pos_expr), group.by = cl) +
+          RotatedAxis() + ggtitle(cl) + theme(axis.text.x = element_text(size = 7)))
+}
+pct_ob <- sapply(split(colnames(obj), obj$festem_cluster), function(cells)
+  Matrix::rowMeans(LayerData(obj, layer = "counts")[intersect(c("sp7", "col10a1a"), rownames(obj)), cells, drop = FALSE] > 0))
+knitr::kable(pct_ob, digits = 2, caption = "Fraction of cells detecting sp7 / col10a1a per Festem cluster")
+```
+
+## 7 · SRG candidate table
+These are candidates and need validation. The criteria are:
+- the gene is Festem-selected;
+- it is a significant positive marker of a Festem cluster;
+- its logFC is greater than 0.5;
+- its specificity (pct.1 − pct.2) is at least 0.2.
+
+Clusters are **annotated, not excluded**, when they look timepoint-driven (>80% of cells from one
+timepoint, >1.5× its overall share) or embryo-driven (>50% from one embryo). Stage-specific clusters
+can still be spatial, because different bones form at different stages. Unflagged clusters are listed first.
+```{r candidates}
+hvg_marker_genes <- unique(mk_h$gene[mk_h$p_val_adj < 0.05])
+avg_tp <- AverageExpression(obj, group.by = "timepoint", features = fg, layer = "data")$RNA
+colnames(avg_tp) <- levels(obj$timepoint)  # AverageExpression prefixes numeric names with "g"
+cand <- mk_f %>%
+  filter(festem_selected, p_val_adj < 0.05, avg_log2FC > 0.5, specificity >= 0.2,
+         ) %>%
+  left_join(flags$Festem %>% select(cluster, n, top_timepoint, frac_fin_bud,
+                                    timepoint_driven, embryo_driven) %>%
+              mutate(cluster = as.character(cluster)),
+            by = c("cluster" = "cluster"), copy = TRUE) %>%
+  mutate(in_hvg = gene %in% hvg, seurat_arm_marker = gene %in% hvg_marker_genes,
+         positional_panel = gene %in% pos,
+         peak_timepoint = colnames(avg_tp)[apply(avg_tp[gene, , drop = FALSE], 1, which.max)],
+         festem_rank = obj[["RNA"]][[]][gene, "Festem_rank"]) %>%
+  mutate(confounded = timepoint_driven | embryo_driven) %>%
+  arrange(confounded, cluster, desc(specificity))
+cat(nrow(cand), "candidates across", length(unique(cand$cluster)), "clusters\n")
+cat("In unflagged clusters:", sum(!cand$confounded), "\n")
+cat("Festem-only (not HVG):", sum(!cand$in_hvg), "| also Seurat-arm marker:", sum(cand$seurat_arm_marker), "\n")
+knitr::kable(head(cand[, c("cluster", "gene", "avg_log2FC", "pct.1", "pct.2", "specificity",
+                           "in_hvg", "seurat_arm_marker", "positional_panel", "peak_timepoint",
+                           "frac_fin_bud", "confounded")], 60), digits = 3)
+write.csv(cand, file.path(out_dir, "srg_candidates.csv"), row.names = FALSE)
+write.csv(agree, file.path(out_dir, "partition_agreement.csv"), row.names = FALSE)
+write.csv(sil, file.path(out_dir, "cluster_quality.csv"), row.names = FALSE)
+```
