@@ -1,0 +1,150 @@
+---
+title: "10 · Skeletogenic NC pool — `r params$dataset`"
+output:
+  html_document:
+    toc: true
+    code_folding: hide
+params:
+  dataset: "zscape"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 10, fig.height = 5)
+source(file.path(rprojroot::find_root("CLAUDE.md"), "R/lineage.R"))
+library(pheatmap)
+cfg <- load_lineage_config()
+ds <- params$dataset
+out <- lineage_dir(cfg)
+set.seed(SEED)
+# Write/replace this dataset's rows in a shared CSV (one file across datasets).
+upsert_csv <- function(df, path) {
+  if (file.exists(path)) {
+    old <- read.csv(path, check.names = FALSE)
+    old <- old[old$dataset != ds, , drop = FALSE]
+    for (v in intersect(c("dataset", "cluster", "timepoint", "label"), names(old))) old[[v]] <- as.character(old[[v]])
+    if (!nrow(old)) old <- NULL
+    for (v in intersect(c("cluster", "timepoint", "label"), names(df))) df[[v]] <- as.character(df[[v]])
+    df <- dplyr::bind_rows(old, df)
+  }
+  write.csv(df, path, row.names = FALSE)
+}
+```
+
+Plan: `prompts/ob_lineage_plan_v1.md`, Phase 1. Pool rules, module lists and filter thresholds come from `config/lineage.yml`.
+
+## Raw pool
+```{r load}
+raw <- load_raw_pool(ds, cfg)
+obj <- build_clean(raw)
+rm(raw); invisible(gc())
+obj
+mg <- module_genes(cfg, rownames(obj), ds)
+knitr::kable(mg$missing, caption = "Module genes absent from this dataset (after build_clean, min.cells = 3)")
+raw_tab <- as.data.frame(table(label = obj$pool_label, timepoint = obj$timepoint), responseName = "n_raw")
+raw_tab <- raw_tab[raw_tab$n_raw > 0, ]
+cat("cells:", ncol(obj), "| median UMI:", median(obj$nCount_RNA), "| median genes:", median(obj$nFeature_RNA), "\n")
+if (ds == "zscape") print(table(obj$timepoint))
+```
+
+## Embedding and contaminant filter
+Rule (per cluster, module means z-scored across clusters): drop when any contaminant z > `r cfg$pools$filter$contaminant_z` **and** ≥ `r 100*cfg$pools$filter$detection_min_frac`% of cells expressing ≥ `r cfg$pools$filter$detection_min_genes` of its genes (≥ `r cfg$pools$filter$detection_fold`× the pool median) **and** mesenchymal z < `r cfg$pools$filter$mesenchymal_z_max`; never drop a cluster with ≥ `r 100*cfg$pools$filter$protect_ob_frac`% annotated OBs. Re-embed after each removal; up to 3 rounds.
+
+```{r refine}
+ref <- refine_pool(obj, cfg, mg$modules)
+obj <- ref$obj
+e <- obj@misc$embed
+cat(sprintf("final: %d cells, %d PCs, resolution %.1f, %d clusters, k = %d\n",
+            ncol(obj), max(e$dims), e$resolution, nlevels(obj$pool_cluster), e$k))
+cat("final round has no cluster meeting the contaminant rule:", ref$final_clean, "\n")
+knitr::kable(e$sweep, caption = "Resolution sweep (final round)")
+```
+
+### Removed clusters
+```{r removed}
+removed <- ref$removed
+if (is.null(removed)) removed <- data.frame(round = integer(), cluster = character())
+removed$dataset <- rep(ds, nrow(removed))
+knitr::kable(removed)
+upsert_csv(removed, file.path(out, "removed_clusters.csv"))
+```
+
+### Cluster × module z (all rounds)
+```{r zs, fig.height=7}
+zs <- ref$zs
+zs$dataset <- ds
+write.csv(zs, file.path(out, paste0(ds, "_cluster_module_z.csv")), row.names = FALSE)
+fz <- zs[zs$round == max(zs$round), ]
+mods <- intersect(names(unlist(unname(cfg$modules), recursive = FALSE)), colnames(fz))
+mat <- as.matrix(fz[, mods]); rownames(mat) <- paste0("cl", fz$cluster, " (n=", fz$n_cells, ")")
+pheatmap(mat, cluster_cols = FALSE, breaks = seq(-3, 3, length.out = 101),
+         main = "Final clusters: module z across clusters", fontsize_row = 7)
+```
+
+## Final pool
+```{r umap, fig.width=14, fig.height=6}
+lab_n <- table(obj$pool_label)
+obj$label_plot <- ifelse(obj$pool_label %in% names(lab_n)[lab_n >= 30], obj$pool_label, "other (<30)")
+DimPlot(obj, label = TRUE, repel = TRUE) + NoLegend() +
+  DimPlot(obj, group.by = "label_plot") + theme(legend.text = element_text(size = 7))
+DimPlot(obj, group.by = "timepoint") + DimPlot(obj, group.by = "embryo") + NoLegend()
+```
+
+```{r features, fig.width=14, fig.height=8}
+sc <- grep("^mod_", colnames(obj@meta.data), value = TRUE)
+FeaturePlot(obj, sc, ncol = 5, order = TRUE) & NoAxes() & theme(plot.title = element_text(size = 8))
+```
+
+### Composition
+```{r composition}
+fin_tab <- as.data.frame(table(label = obj$pool_label, timepoint = obj$timepoint), responseName = "n_final")
+comp <- merge(raw_tab, fin_tab, all.x = TRUE)
+comp$n_final[is.na(comp$n_final)] <- 0L
+comp$pct_kept <- round(100 * comp$n_final / comp$n_raw, 1)
+comp$dataset <- ds
+comp <- comp[order(comp$timepoint, -comp$n_raw), ]
+knitr::kable(comp, row.names = FALSE)
+upsert_csv(comp, file.path(out, "pool_composition.csv"))
+cl_lab <- as.data.frame.matrix(table(obj$pool_cluster, obj$pool_label))
+write.csv(cl_lab, file.path(out, paste0(ds, "_cluster_by_label.csv")))
+cat("Cramér's V, cluster vs embryo/replicate:", round(cramers_v(obj$pool_cluster, obj$embryo), 3), "\n")
+if (ds == "zscape") cat("Cramér's V, cluster vs timepoint:", round(cramers_v(obj$pool_cluster, obj$timepoint), 3), "\n")
+```
+
+### OB-gene detection per cluster
+% of cells with ≥ 1 UMI. `any_ob_mature` = at least one `ob_mature` gene.
+```{r ob-detect}
+ob_genes <- intersect(c("runx2a", "runx2b", "sp7", "col10a1a", "ifitm5", "spp1", "entpd5a", "ihha",
+                        "abcc6a", "col1a1a", "sox9a", "col2a1a", "twist1a", "prrx1a"), rownames(obj))
+cnt <- LayerData(obj, layer = "counts")
+cl <- obj$pool_cluster
+det <- sapply(ob_genes, function(g) tapply(cnt[g, ] > 0, cl, mean))
+om <- intersect(cfg$modules$lineage$ob_mature, rownames(obj))
+det <- cbind(n = as.integer(table(cl)), ob_annot = tapply(obj$ob_annot, cl, mean),
+             any_ob_mature = tapply(Matrix::colSums(cnt[om, ] > 0) > 0, cl, mean), det)
+det <- round(det, 3)
+det[, -1] <- 100 * det[, -1]
+det <- det[order(-det[, "any_ob_mature"]), ]
+knitr::kable(det)
+write.csv(data.frame(dataset = ds, cluster = rownames(det), det, check.names = FALSE),
+          file.path(out, paste0(ds, "_ob_detection_by_cluster.csv")), row.names = FALSE)
+```
+
+## Checks
+```{r checks}
+ari <- rerun_ari(obj)
+cat("same-seed rerun clustering ARI:", ari, "\n")
+stopifnot(ari == 1, ref$final_clean)
+if (ds == "zscape") {
+  n72 <- sum(obj$ob_annot & obj$timepoint == "72"); n48 <- sum(obj$ob_annot & obj$timepoint == "48")
+  cat("OBs in pool: 72 hpf", n72, "| 48 hpf", n48, "\n")
+  stopifnot(n72 == 186, n48 == 92)
+}
+if (ds == "fabian5") stopifnot(sum(obj$ob_annot) == 242)
+obj$label_plot <- NULL
+saveRDS(obj, file.path(out, paste0(ds, "_pool.rds")))
+write.csv(data.frame(dataset = ds, cells = ncol(obj), clusters = nlevels(obj$pool_cluster),
+                     pcs = max(e$dims), resolution = e$resolution, rounds = max(zs$round),
+                     removed_clusters = nrow(removed), rerun_ari = ari),
+          file.path(out, paste0(ds, "_pool_summary.csv")), row.names = FALSE)
+sessionInfo()
+```

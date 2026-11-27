@@ -4,3 +4,5 @@ results/
 .Rproj.user/
 *_cache/
 *_files/
+env/.venv/
+__pycache__/

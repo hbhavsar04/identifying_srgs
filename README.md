@@ -105,3 +105,121 @@ Outputs are written to `results/<cellset>/` (gitignored): the HTML reports, the 
 1. With these annotations and this depth, neither method finds osteoblast subclusters that are clearly spatial. Most of the structure follows stage, embryo, or the osteoblast/fin-bud split.
 2. Festem is useful once there are thousands of cells, where it gives more stable and more specific clusters from about 10× fewer genes. On the 334-cell subset it lacks the power to select genes reliably.
 3. The candidate tables in `results/*/srg_candidates.csv` are hypotheses, not validated SRGs. The `ob334` unflagged clusters (3, 5 and 6) are the most direct leads for osteoblast heterogeneity. Validation needs spatial data, such as in situ hybridization or HCR. Next steps could be to restrict `obfin` to the osteoblast cells, to regress out or stratify by timepoint, or to bring in more osteoblasts from later stages.
+
+## Lineage expansion (OB-lineage reference, HCR panel, Tangram test)
+
+Plan: `prompts/ob_lineage_plan_v1.md` (run gate by gate, 2026-11-25/26). Goal: expand the 186-cell ZSCAPE
+72 hpf OB reference to the skeletogenic neural-crest cells around it, find OB progenitor / neighbour
+states, choose ~60 new HCR genes that resolve them, and test whether the expanded reference improves
+the Tangram map of the opercle (Part 2, in `voxel_measurements_and_analysis/scrna_matching/iter4_lineage_reference/`).
+
+```sh
+bash analysis/run_lineage.sh     # Part 1, from the repo root (several hours, mostly GPCCA; uv env in env/, config in config/lineage.yml)
+```
+
+```
+config/lineage.yml            paths, modules, filters, panel settings and every gate decision (with comments)
+R/lineage.R                   pool building, module scoring, contaminant filter (sources R/utils.R)
+analysis/10_build_pools.Rmd   Phase 1 pools per dataset (rendered by 10_render_pools.R)
+analysis/11_export_pools.R    raw-count export for Python
+py/20_trajectory.py           Phase 2: CellRank 2 states and OB fate (ZSCAPE and Fabian separately)
+py/30_spapros_panel.py        Phase 3: spapros selection, consensus, DE comparators, evaluation, panel table
+py/31_export_tangram_sets.py  Part 1 -> Part 2 handoff (h5ad reference sets on the share)
+```
+
+Outputs in `results/lineage/` (gitignored): pools, `trajectory/`, `panel/` (`hcr_panel_v1.csv`), `tangram_sets/`.
+ZSCAPE and Fabian are never integrated, and nothing is imputed.
+
+### Phase 1: pools
+
+- ZSCAPE: skeletogenic NC pool at 48–96 hpf, 22,547 cells (48 hpf 12,634 / 72 hpf 8,823 / 96 hpf 1,090),
+  21 clusters; the 186 (72 hpf) and 92 (48 hpf) annotated OBs are all present and sit in one cluster (96% OB).
+  Fabian sox10 lineage: 3 dpf 6,314 cells, 5 dpf 9,742 cells (242 OBs, one 96%-OB cluster).
+- The plan's relative contaminant rule removed real mesenchyme and never converged; with an added
+  absolute detection floor (user decision) **no cluster was removed** in any dataset.
+  "connective tissue-meninges-dermal FB (late)" was dropped from the ZSCAPE label list: it is basal
+  epidermis (krt5, krtt1c19e, tp63). Fast-muscle transcripts are ambient across ZSCAPE; one muscle-ambient
+  cluster (no myod1/myf5) was kept and flagged.
+- **Fabian 3 dpf has no OB cluster** (no cluster has > 10% of cells with any mature-OB gene; runx2a ≤ 2%).
+
+### Phase 2: states and OB fate (CellRank 2)
+
+Kernel 0.8 pseudotime (DPT) + 0.2 connectivity; GPCCA macrostates; Fabian 3 + 5 dpf merged within Fabian.
+
+- OB is a predicted terminal state in both datasets (alongside chondro ×2–3, fibro, mesenchyme, OB_early).
+  The OB lineage is 99% annotated OBs (ZSCAPE 266 cells, Fabian 233). CytoTRACE-kernel sensitivity run:
+  OB-lineage Jaccard 0.98 (ZSCAPE) and 0.88 (Fabian).
+- **No OB progenitors outside the OB cluster** in either dataset: at the 0.4 fate threshold only 8 (ZSCAPE)
+  and 19 (Fabian) cells are OB_progenitor; 76% / 68% of cells are uncommitted.
+- runx2 → sp7 → col10a1a/ifitm5 ordering along pseudotime passes in Fabian and **fails in ZSCAPE**
+  (median DPT 0.080 at 48 hpf vs 0.083 at 72 hpf: pseudotime barely separates the stages).
+- State concordance between datasets (state-vs-rest logFC correlation): OB ≈ 0.55, chondro_2 0.68,
+  uncommitted 0.60; fibro, OB_early and mesenchyme have no clear match.
+- Gate 2 decision (user): head mesenchyme / pharyngeal arch are plausible OB sources, so the panel adds an
+  **"OB_proximal" class = top 1% of non-OB cells by OB fate** (86 ZSCAPE 72 hpf, 63 Fabian 3 dpf cells).
+  **This is a weakness**: it is a ranking, not a progenitor state, and there is no better option yet.
+
+### Phase 3: HCR panel (`results/lineage/panel/hcr_panel_v1.csv`, 60 genes)
+
+- Cells: ZSCAPE 72 hpf and Fabian 3 dpf pools; classes = fine CellRank states (+ OB_proximal). Universe:
+  genes shared by both, minus mt/ribosomal/hemoglobin/contaminant genes, detected in ≥ 5% of one 72 hpf
+  class (5,990 genes). The 29 panel genes are preselected.
+- spapros (70 new genes per dataset, 10 shared) gave a 60-gene tiered consensus. It also picked
+  dissociation-stress, housekeeping and mitochondrial genes (jun, junba, atf3, eef1g, NC-002333.4, …),
+  excluded after selection; rhag (erythroid) was excluded on review.
+- **A plain DE list beat spapros**, so the final panel is **DE_both** (user decision): wilcoxon DE per class,
+  round-robin across classes, alternating the ZSCAPE and Fabian rankings. 25 of its 60 genes are in the
+  spapros consensus.
+
+Forest-classifier balanced accuracy (spapros `forest_clfs`: XGBoost, 5-fold × 5 seeds, mean per-class recall;
+classes < 40 cells are not scored, so OB_progenitor is never evaluated):
+
+| Gene set (panel + 60 new) | ZSCAPE 72 hpf | Fabian 3 dpf |
+|---|---|---|
+| panel only (29) | 0.277 | 0.381 |
+| best of 5 detection-matched random | 0.451 | 0.512 |
+| top-60 HVG | 0.442 | 0.547 |
+| spapros consensus | 0.628 | 0.663 |
+| DE chosen in the other dataset | 0.489 | 0.580 |
+| **DE_both (final panel)** | **0.735** | **0.702** |
+
+- All sets except "DE in the other dataset" were chosen on the cells they are scored on, so their
+  numbers are optimistic; the cross-dataset row shows how much is lost in transfer.
+- OB_proximal recall stays low (0.30 ZSCAPE, 0.24 Fabian).
+- Panel content: matrix/cartilage genes (collagens, matrilins), OB-class genes (enam, col5a2b, plxna3, cntfr,
+  ptprfb, kremen1), mesenchyme TFs (foxp4, pbx3b, lmx1ba/bb, foxf2a, her6) and sost/sfrp2/ucmab. Several
+  are < 1% detected in ZSCAPE OBs (sost, sfrp2, ucmab, f13a1b); eight are unnamed (si:/zgc:/BX…) genes.
+  hmgb2a (proliferation) and tmsb4x (near-ubiquitous) are kept but flagged in `notes`.
+
+### Phase 4: Tangram with the lineage reference (stopped after the sub-sample arms)
+
+Baseline reproduced (seed 1, max |Δ| 0.005). Adding the lineage cells **as cells** makes the opercle map
+worse: LOO median 0.35 → 0.24–0.28 in cells and constrained (filter 186/500/1000) modes, E_rim band −0.08 to
+−0.10, and ihha → D is lost. The filter keeps the same fraction of every state, so the opercle region shows
+no preference for any state, OB_proximal included. Pooling 48–96 hpf hurts; Fabian 3 dpf fails. Clusters
+mode (28 state profiles) scores 0.59 with gains in both bands, but sends ihha to the wrong subdomain and
+puts ~80% of the mass on non-OB states; it most likely reflects averaging, and the OB-only clusters
+control was not run. Details: `scrna_matching/iter4_lineage_reference/results/README.md`.
+
+### Caveats
+
+- ZSCAPE depth (~360 UMI): positional TFs drop out, and pseudotime hardly separates 48 from 72 hpf.
+- OB_proximal is a fate ranking, not a validated progenitor state (see Phase 2).
+- The pools contain other condensations (cleithrum, parasphenoid, PA1, ventral hyoid); the opercle-only
+  target forces them in, which is one reason the expanded arms lose.
+- 81% of the 72 hpf OBs come from one plate; the OB rim artifact disappears in the expanded arms only
+  because non-OB cells take the rim calls.
+- The panel was chosen to separate scRNA states, not for spatial information; whether it helps the map is
+  untested until HCR (the add-back result says detection is what predicts gain).
+
+### Done criteria (`prompts/ob_lineage_plan_v1.md`)
+
+| # | Criterion | Status |
+|---|---|---|
+| 1 | Pools built and documented, Gate 1 reviewed | pass (no cluster removed; filter rule changed by the user) |
+| 2 | States and OB trajectories in both datasets, checks, Gate 2 reviewed | pass, with failed checks reported: marker order fails in ZSCAPE; no progenitor state |
+| 3 | 50–70 new genes beating panel-only and random | pass (60; DE_both 0.735 / 0.702 vs random 0.451 / 0.512). Per-state gain for OB_progenitor not testable (too few cells) |
+| 4 | Tangram gate table for all arms, with band metrics and interpretation | partial: A0–A5 done; W0/W1 not run (stopped by the user) |
+| 5 | Write-ups (this section, iter4 README, scrna_matching progress row) | done |
+| 6 | `analysis/run_lineage.sh` and the iter4 commands regenerate everything | done (scripts written; not re-run end to end) |
+| 7 | Commit only when asked | nothing committed |

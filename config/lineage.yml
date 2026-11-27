@@ -1,0 +1,154 @@
+# Config for the OB-lineage expansion (prompts/ob_lineage_plan_v1.md).
+# Read by R/lineage.R (yaml::read_yaml) and py/common.py (yaml.safe_load).
+# All source paths are read-only.
+
+paths:
+  zscape: "/Volumes/kwongroup/Hayden Bhavsar/R files/RDS_seurat_objects/saunders.rds"
+  ob_subset: "/Volumes/kwongroup/Hayden Bhavsar/R files/RDS_seurat_objects/ob_subset.rds"
+  fabian3: "/Users/msbl/Desktop/Hayden/git_repos/sox10_sc_analysis/data/raw/3dpf_scRNA.rds"
+  fabian5: "/Users/msbl/Desktop/Hayden/git_repos/sox10_sc_analysis/data/raw/5dpf_scRNA.rds"
+  fabian5_ob: "/Users/msbl/Desktop/Hayden/git_repos/sox10_sc_analysis/data/processed/5dpf_RNA_OB.rds"
+  fabian5_ob_cluster: "14"
+  scrna_matching_repo: "/Users/msbl/Desktop/Hayden/git_repos/voxel_measurements_and_analysis/scrna_matching"
+  atlas_gene_map: "/Users/msbl/Desktop/Hayden/git_repos/voxel_measurements_and_analysis/scrna_matching/iter0_data_prep/results/atlas_gene_map.csv"
+  training_genes: "/Users/msbl/Desktop/Hayden/git_repos/voxel_measurements_and_analysis/scrna_matching/iter0_data_prep/results/iter1_training_genes.csv"
+  results: "results/lineage"          # relative to project root (gitignored)
+
+# The 29 HCR panel genes in scRNA symbols (atlas -> sc via ATLAS_TO_SC in scrna_matching/paths.py:
+# bmp8 -> bmp8a, mfsd -> mfsd2b, sich211 -> si:ch211-106n13.3, znf385 -> znf385b).
+# Checked 2026-11-25: all 29 present in ZSCAPE and Fabian 3/5 dpf.
+# ihha is validation-only in Tangram (not trained).
+panel_genes: [abcc6a, bcl2a, bgna, bgnb, bmp8a, bmper, cadm1b, cd81b, col10a1a, col1a1a,
+              emid1, fgfr3, ifitm5, ihha, klf13, mfsd2b, nfatc1, pltp, ppfibp2a, runx2a,
+              sdc2, si:ch211-106n13.3, slc8a4b, sox6, spp1, tnfrsf11a, tnmd, tox, znf385b]
+panel_validation_only: [ihha]
+
+# Gene modules. Missing genes are logged per dataset at load time, never dropped silently.
+# Presence check (2026-11-25) vs ZSCAPE / Fabian 3 dpf / Fabian 5 dpf: all present except
+#   hoxa3a: absent from ZSCAPE (present in Fabian 3/5 dpf)
+#   msxe:   absent from all three (retired ZFIN symbol; present msx genes: msx1a, msx1b, msx2a, msx2b, msx3)
+modules:
+  lineage:
+    ob_mature:       [sp7, col10a1a, ifitm5, spp1, bglap, entpd5a, panx3, slc8a4b, cd81b]
+    ob_early:        [runx2a, runx2b, col1a1a, col1a2, sparc, alpl]
+    nc_mesenchyme:   [twist1a, twist1b, prrx1a, prrx1b, pdgfra, nr2f2, nr2f5, msx1b, dlx2a]
+    chondro:         [sox9a, col2a1a, matn1, col9a1a, acana, ucmaa]
+    ligament_tendon: [scxa, tnmd, mkxa, col12a1a, matn4]
+    fibro:           [dcn, lum, col6a1, col6a2]
+    proliferation:   [mki67, pcna, top2a]
+  contaminant:
+    muscle:      [myod1, myog, mylpfa, acta1a, ttn.1, ttn.2]
+    epithelial:  [krt4, krt5, epcam, cdh1]
+    endothelial: [kdrl, cdh5]          # not fli1a (also NC mesenchyme)
+    blood:       [hbaa1, hbba1]
+    pigment:     [mitfa, pmela, tyrp1b]
+    glia_neural: [plp1b, mbpa, elavl3]
+  # Descriptive priors only (check against literature); never used as filters.
+  positional:
+    hox2:         [hoxa2b, hoxb2a]
+    hox3:         [hoxa3a, hoxb3a, hoxd3a]
+    dorsal:       [jag1b]
+    intermediate: [dlx3b, dlx5a, dlx6a]   # msxe dropped (retired symbol; user decision 2026-11-25)
+    ventral:      [hand2]
+
+# "Mesenchymal" score used by the contaminant filter (plan Phase 1 step 3).
+mesenchymal_modules: [nc_mesenchyme, ob_mature, ob_early, chondro]
+
+pools:
+  zscape:
+    timepoints: ["48", "72", "96"]
+    drop_gene_target: [tbx16-mut]
+    include_cell_type_sub:
+      - osteoblast
+      - mineralized tissue, bone
+      - jaw chondrocyte
+      - chondrocranium
+      - pharyngeal arch (contains muscle, early cartilage)
+      - pharyngeal arch (early)
+      - pharyngeal arch (NC-derived)
+      - head mesenchyme/PA cartilage
+      - head mesenchyme (maybe ventral, hand2+)
+      - head mesenchyme (contains sclerotome)
+      - cranial neural crest (ntm, foxd3+)
+      - periocular mesenchyme
+      - head/eye connective tissue
+      - odontoblast
+    # Removed from the plan's list (user decision 2026-11-25): "connective tissue-meninges-dermal FB (late)".
+    # It is basal epidermis: vs the rest of the pool, krt4 97% (38%), krt5 80% (6%), krtt1c19e 62% (2%),
+    # tp63 28% (1%), cldni 65% (1%); twist1a/prrx1a/pdgfra ~0%; col1a1a/col1a2 >= 95% (larval epidermis).
+  filter:
+    # Plan rule: contaminant z > 1.5 and mesenchymal z < 0 (z across clusters). The z test alone is
+    # relative and always flags someone (Fabian 3 dpf did not converge; flagged clusters had ~0%
+    # detection). Added detection floor (user decision 2026-11-25): a cluster also needs >= 25% of
+    # its cells expressing >= 2 genes of that contaminant module, at >= 3x the pool median.
+    contaminant_z: 1.5
+    detection_min_genes: 2
+    detection_min_frac: 0.25
+    detection_fold: 3
+    mesenchymal_z_max: 0
+    protect_ob_frac: 0.20     # never drop a cluster with >= 20% annotated osteoblasts
+    n_markers_log: 10
+
+seed: 321
+
+# Gate 1 decisions (user, 2026-11-25)
+#   ZSCAPE pool cluster 2 (1,945 cells; fast-muscle structural genes ~2x ambient, no myod1/myf5/mef2ca)
+#   is kept; flagged through Phase 2 as possible muscle ambient/doublets.
+#   Fabian trajectory: 3 dpf + 5 dpf merged within Fabian (trajectory only), OB endpoint = 5 dpf cluster 14.
+flags:
+  zscape_muscle_ambient_cluster: "2"
+trajectory:
+  fabian_merge: [fabian3, fabian5]
+
+# Gate 2 decision (user, 2026-11-25). CellRank found no OB progenitors outside the OB cluster in either
+# dataset (OB_progenitor 8 ZSCAPE / 19 Fabian cells; OB fate ~0.03 elsewhere). As a stopgap, spapros gets an
+# extra class "OB_proximal" = top `top_frac` of non-OB cells by OB fate probability, defined within each
+# spapros cell set (ZSCAPE 72 hpf; Fabian 3 dpf). KNOWN WEAKNESS: this is a rank cut on a flat fate
+# distribution, not evidence of OB commitment; carry it into every write-up. The ZSCAPE top cells come mostly
+# from pharyngeal arch and head mesenchyme labels, which the user considers plausible OB sources.
+ob_proximal:
+  top_frac: 0.01
+  weak_evidence: true
+
+panel:
+  n_new_target: 60          # final consensus (50-70)
+  n_new_select: 70          # per-dataset spapros target beyond the preselected panel genes
+  min_det_trainable: 0.05   # >= 5% of cells in >= 1 class of the ZSCAPE 72 hpf set
+  min_class_cells: 15
+  n_hvg: 8000
+  n_random_draws: 5
+  # HCR-suitability exclusions, applied at consensus (after spapros, which had already run): spapros
+  # picked dissociation-stress IEGs (jun, junba, atf3, dnajb1b), ubiquitous housekeeping genes (eef1g,
+  # h3f3c, hmgn2) and a mitochondrial transcript (NC-002333.4; NC_002333 = zebrafish mt genome).
+  # Excluded genes are logged with their reason; comparison sets are drawn from the same filtered pool.
+  exclude_regex:
+    mitochondrial: "^(mt-|NC-002333)"
+    dissociation_stress: "^(fos|jun|atf3|egr[0-9]|ier[0-9]|dusp1$|hsp|dnaj|gadd45|btg2|zfp36|nr4a|socs3|klf2a$|klf4$|cebpd$)"
+    housekeeping: "^(eef[0-9]|eif[0-9]|tpt1$|rack1$|h3f3|h2a|h2b|hist|hmgn|tuba|tubb|actb|gapdh|ppia|ubb$|ubc$|sec61|dynll|rpl|rps)"
+  # Explicit per-gene exclusions (user review of hcr_panel_v1, 2026-11-26). The consensus refills from
+  # the next tier-2 gene. rhag: erythroid Rh-associated glycoprotein; not caught by the contaminant
+  # filter because the blood module has no genes passing min.cells in ZSCAPE.
+  # Kept on review: si:/zgc: genes and genes < 5% detected in ZSCAPE 72 hpf OBs.
+  exclude_genes:
+    rhag: erythroid
+  spapros_sets: {zscape: "72", fabian: "3dpf"}
+  # DE comparators (stage de): wilcoxon per spapros class, round-robin across classes, drawn from the
+  # same eligible pool as the consensus (trainable, not panel, not excluded; consensus genes allowed).
+  #   DE_self = selected and evaluated in the same dataset (optimistic);
+  #   DE_other = selected in the other dataset (cross-dataset transfer, like the consensus must do);
+  #   DE_both = alternate the two per-dataset DE rankings (dataset-agnostic, same size as consensus).
+  de_n_per_class: 200
+  # Final HCR panel source (user choice 2026-11-26): DE_both beat the spapros consensus on forest
+  # balanced accuracy (ZSCAPE 0.735 vs 0.628; Fabian 0.702 vs 0.663). "consensus" restores spapros.
+  final_set: de_both
+
+# Existing HCR nominee lists: overlap is reported only, never used for selection.
+nominee_lists:
+  iter3_hcr_shortlist: "/Users/msbl/Desktop/Hayden/git_repos/voxel_measurements_and_analysis/scrna_matching/iter3_candidates/results/hcr_shortlist.csv"
+  rerank_detection: "/Users/msbl/Desktop/Hayden/git_repos/voxel_measurements_and_analysis/scrna_matching/iter3_candidates/rerank_detection/results/hcr_shortlist_detection_aware.csv"
+  exploration: "/Users/msbl/Desktop/Hayden/git_repos/voxel_measurements_and_analysis/scrna_matching/iter3_candidates/exploration/results/exploration_nominees.csv"
+  ob334_srg: "/Users/msbl/Desktop/Hayden/git_repos/identifying_srgs/results/ob334/srg_candidates.csv"
+# sox10-repo list as given in the plan (the plan's list ends with "..."; no file found in sox10_sc_analysis).
+sox10_list: [scxa, lum, mafa, matn4, ifitm5, panx3, col10a1a, slc8a4b]
+# ZSCAPE 72 hpf context export with cranial muscle (for the "also marks muscle" flag).
+context72_export: "/Volumes/kwongroup/Hayden Bhavsar/voxel_csvs/ants_sygn_pooled_bin1x5x5_rollingball-percentile_mc2_excl-ihhb/seurat_scale_only_rpctFALSE_dims10_res0.3/opercle_subclustering/scrna_matching/iter0_data_prep/reference/zscape_context72"

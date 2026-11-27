@@ -1,0 +1,23 @@
+[project]
+name = "identifying-srgs-lineage"
+version = "0.1.0"
+description = "OB-lineage pools: trajectories (CellRank 2) and HCR panel selection (spapros). CPU only."
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "scanpy>=1.10",
+    "anndata>=0.10",
+    "cellrank>=2.0",
+    "spapros",
+    "numpy<2.4",                # spapros 0.1.6 calls np.in1d (removed in numpy 2.4)
+    "pyyaml>=6",
+    "matplotlib>=3.8",
+    "pandas>=2.1",
+    "scipy>=1.11",
+    "scikit-learn>=1.4,<1.8",   # sklearn >= 1.8 returns csr_array, which scanpy 1.11 neighbors cannot read
+    "pynndescent<0.6",          # 0.7 returns csr_array, which scanpy 1.11 neighbors cannot read
+    "leidenalg",
+    "igraph",
+]
+
+[tool.uv]
+package = false
